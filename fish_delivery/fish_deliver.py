@@ -20,9 +20,6 @@ The delivery motion is deliberately dumb and slow for safety near a child:
 
 Later the 30 s wait becomes a voice command: just publish on
 /deliver_fish/release instead of relying on the timeout.
-
-Requires the driver in trajectory mode (mode:=trajectory) so move_to_pose
-honors the duration argument for the slow reach.
 """
 import threading
 
@@ -53,9 +50,11 @@ class FishDeliver(hm.HelloNode):
         self.wrist_yaw = self.declare_parameter(
             'wrist_yaw', 0.0).value            # rad, point straight across mat
         self.extend_distance = self.declare_parameter(
-            'extend_distance', 0.4).value
+            'extend_distance', 0.4).value      # m, total reach across mat
+        self.extend_step = self.declare_parameter(
+            'extend_step', 0.02).value         # m per step (smaller = smoother)
         self.extend_duration = self.declare_parameter(
-            'extend_duration', 20.0).value
+            'extend_duration', 20.0).value     # s, total time for the reach
         self.wait_sec = self.declare_parameter(
             'wait_sec', 30.0).value            # s, hold for the child to grab
 
@@ -132,12 +131,20 @@ class FishDeliver(hm.HelloNode):
             return self._retract_and_reset(start_lift, start_ext,
                                            start_pitch, start_yaw, ok=False)
 
-        ext_to = self._get_joint('wrist_extension') + self.extend_distance
-        self.move_to_pose({'wrist_extension': ext_to},
-                          duration=self.extend_duration, blocking=True)
-        if self._cancel:
-            return self._retract_and_reset(start_lift, start_ext,
-                                           start_pitch, start_yaw, ok=False)
+        # Slow reach: small position-mode steps with a pause between, so the
+        # motion stays gentle near the child. /release or /stop sets the wait
+        # event, which short-circuits the pause and exits the loop early.
+        ext_from = self._get_joint('wrist_extension')
+        n_steps = max(1, round(self.extend_distance / self.extend_step))
+        pause_per_step = self.extend_duration / n_steps
+        for i in range(1, n_steps + 1):
+            if self._cancel:
+                return self._retract_and_reset(start_lift, start_ext,
+                                               start_pitch, start_yaw, ok=False)
+            target = ext_from + self.extend_distance * (i / n_steps)
+            self.move_to_pose({'wrist_extension': target}, blocking=True)
+            if self._wait_event.wait(timeout=pause_per_step):
+                break  # released or stopped mid-reach
 
         self.get_logger().info(
             f"Holding up to {self.wait_sec:.0f}s for the child to grab.")
