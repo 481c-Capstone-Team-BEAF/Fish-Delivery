@@ -49,8 +49,8 @@ class FishDeliver(hm.HelloNode):
             'wrist_pitch', -0.3).value         # rad, negative = tip down a bit
         self.wrist_yaw = self.declare_parameter(
             'wrist_yaw', 0.0).value            # rad, point straight across mat
-        self.extend_distance = self.declare_parameter(
-            'extend_distance', 0.4).value      # m, total reach across mat
+        self.extend_target = self.declare_parameter(
+            'extend_target', 0.45).value       # m, absolute wrist_extension at full reach
         self.extend_step = self.declare_parameter(
             'extend_step', 0.02).value         # m per step (smaller = smoother)
         self.extend_duration = self.declare_parameter(
@@ -131,17 +131,17 @@ class FishDeliver(hm.HelloNode):
             return self._retract_and_reset(start_lift, start_ext,
                                            start_pitch, start_yaw, ok=False)
 
-        # Slow reach: small position-mode steps with a pause between, so the
-        # motion stays gentle near the child. /release or /stop sets the wait
-        # event, which short-circuits the pause and exits the loop early.
+        # Slow reach: step the wrist toward the absolute extend_target with a
+        # pause between each step for slow motion
         ext_from = self._get_joint('wrist_extension')
-        n_steps = max(1, round(self.extend_distance / self.extend_step))
+        span = self.extend_target - ext_from
+        n_steps = max(1, round(abs(span) / self.extend_step))
         pause_per_step = self.extend_duration / n_steps
         for i in range(1, n_steps + 1):
             if self._cancel:
                 return self._retract_and_reset(start_lift, start_ext,
                                                start_pitch, start_yaw, ok=False)
-            target = ext_from + self.extend_distance * (i / n_steps)
+            target = ext_from + span * (i / n_steps)
             self.move_to_pose({'wrist_extension': target}, blocking=True)
             if self._wait_event.wait(timeout=pause_per_step):
                 break  # released or stopped mid-reach
