@@ -22,16 +22,29 @@ Later the 30 s wait becomes a voice command: just publish on
 /deliver_fish/release instead of relying on the timeout.
 """
 import threading
+import time
+
+import cv2
+import cv2.aruco as aruco
+import numpy as np
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from std_msgs.msg import Empty, Bool
 import hello_helpers.hello_misc as hm
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image, CameraInfo
 
-START_TOPIC = "/deliver_fish/start"
+START_TOPIC   = "/deliver_fish/start"
 RELEASE_TOPIC = "/deliver_fish/release"
-STOP_TOPIC = "/deliver_fish/stop"
-DONE_TOPIC = "/deliver_done"
+STOP_TOPIC    = "/deliver_fish/stop"
+DONE_TOPIC    = "/deliver_done"
+
+COLOR_TOPIC = "/camera/color/image_raw"
+INFO_TOPIC  = "/camera/color/camera_info"
+
+ARUCO_DICT = aruco.DICT_5X5_1000
+MARKER_ID  = 90
 
 
 class FishDeliver(hm.HelloNode):
@@ -41,6 +54,10 @@ class FishDeliver(hm.HelloNode):
         # up the trajectory client / joint_states sub.
         hm.HelloNode.main(self, 'fish_deliverer', 'fish_deliverer',
                           wait_for_first_pointcloud=False)
+
+        # marker for child delivery
+        self.marker_id     = int(self.declare_parameter('marker_id', MARKER_ID).value)
+        self.marker_size_m = self.declare_parameter('marker_size_m', 0.13).value  # 0.13 is 130mm print size, change if need
 
         # Tunable pose / timing (setup-dependent; tweak per session at launch).
         self.lift_height = self.declare_parameter(
@@ -57,10 +74,29 @@ class FishDeliver(hm.HelloNode):
             'extend_duration', 20.0).value     # s, total time for the reach
         self.wait_sec = self.declare_parameter(
             'wait_sec', 30.0).value            # s, hold for the child to grab
+        self.search_timeout = self.declare_parameter(
+            'search_timeout', 15.0).value      # s, how long to scan before giving up
+
+        # Camera movement, can remove if causes too much errors or unnecessary
+        self.head_tilt_search = self.declare_parameter(
+            'head_tilt_search', -0.8).value    # rad, single float — negative = look down at floor
+        self.head_pan_search = self.declare_parameter(
+            'head_pan_search', 0.0).value
+        self.safe_distance_m = self.declare_parameter(
+            'safe_distance_m', 0.5).value      # m, min distance to human during reach
 
         self._busy = False
         self._cancel = False
         self._wait_event = threading.Event()
+        self._bridge = CvBridge()
+        self._camera_matrix = None
+        self._dist_coeffs = None
+        self._latest_frame = None
+        self._frame_lock = threading.Lock()
+        self._aruco_dict = aruco.getPredefinedDictionary(ARUCO_DICT)
+        self._aruco_params = aruco.DetectorParameters()
+        self._detector = aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
+
         cb = ReentrantCallbackGroup()
 
         self.create_subscription(
@@ -69,11 +105,31 @@ class FishDeliver(hm.HelloNode):
             Empty, RELEASE_TOPIC, self._on_release, 1, callback_group=cb)
         self.create_subscription(
             Empty, STOP_TOPIC, self._on_stop, 1, callback_group=cb)
+        self.create_subscription(
+            Image, COLOR_TOPIC, self._on_image, 1, callback_group=cb)
+        self.create_subscription(
+            CameraInfo, INFO_TOPIC, self._on_camera_info, 1, callback_group=cb)
         self.done_pub = self.create_publisher(Bool, DONE_TOPIC, 10)
 
         self.get_logger().info(
             f"fish_deliverer up; publish Empty on {START_TOPIC} to deliver, "
             f"result on {DONE_TOPIC}.")
+
+    def _on_camera_info(self, msg):
+        if self._camera_matrix is not None:
+            return  # already have it
+        self._camera_matrix = np.array(msg.k).reshape((3, 3))
+        self._dist_coeffs = np.array(msg.d)
+        self.get_logger().info("Camera info received; ready to detect markers.")
+
+    def _on_image(self, msg):
+        try:
+            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f"Error processing image: {e}")
+            return
+        with self._frame_lock:
+            self._latest_frame = frame
 
     def _on_start(self, _msg):
         if self._busy:
@@ -110,31 +166,109 @@ class FishDeliver(hm.HelloNode):
                 self.get_logger().error("No joint states yet; cannot deliver.")
                 self._publish_done(False)
                 return
-            self._publish_done(self._deliver())
+
+            # Optional: move the head to a preset search pose for better marker detection.
+            if self._camera_matrix is None:
+                self.get_logger().error("No camera info yet; cannot deliver.")
+                self._publish_done(False)
+                return
+
+            marker_pos = self._find_marker()
+            if marker_pos is None or self._cancel:
+                self.get_logger().error("Marker not found; cannot deliver.")
+                self._publish_done(False)
+                return
+            self.get_logger().info(f"Marker detected at {marker_pos}; starting delivery.")
+
+            # Pass marker_pos into _deliver so arm uses actual depth to child
+            self._publish_done(self._deliver(marker_pos))
         finally:
             self._busy = False
 
-    def _deliver(self):
+    def _find_marker(self):
+        """
+        Tilt head down, scan for Marker ID self.marker_id, return its translation
+        vector in camera frame (x, y, z meters) or None if not found or cancelled.
+        """
+        self.get_logger().info(
+            f"Tilting head to search for marker "
+            f"(pan={self.head_pan_search:.2f}, "
+            f"tilt={self.head_tilt_search:.2f})...")
+        self.move_to_pose({
+            'joint_head_pan':  self.head_pan_search,
+            'joint_head_tilt': self.head_tilt_search,
+        }, blocking=True)
+
+        time.sleep(1.0)  # wait for the head to settle and frames to update
+
+        deadline = time.time() + self.search_timeout
+        while time.time() < deadline and not self._cancel:
+            with self._frame_lock:
+                frame = self._latest_frame.copy() \
+                    if self._latest_frame is not None else None
+            if frame is None:
+                time.sleep(0.1)
+                continue
+
+            corners, ids, _ = self._detector.detectMarkers(frame)
+
+            # Skip frames where no markers were detected
+            if ids is None:
+                time.sleep(0.05)
+                continue
+
+            for i, marker_id in enumerate(ids.flatten()):
+                if marker_id != self.marker_id:
+                    continue
+                rvec, tvec, _ = aruco.estimatePoseSingleMarkers(
+                    [corners[i]], self.marker_size_m, self._camera_matrix, self._dist_coeffs)
+                tvec = tvec[0][0]  # unpack from arrays
+                self.get_logger().info(f"Found marker {marker_id} at tvec {tvec}.")
+                return tvec
+
+            time.sleep(0.05)
+
+        self.get_logger().warn(
+            f"Marker {self.marker_id} not found after searching for "
+            f"{self.search_timeout:.0f}s.")
+        return None
+
+    def _deliver(self, marker_pos):
         # original position to revert to
-        start_lift = self._get_joint('joint_lift')
-        start_ext = self._get_joint('wrist_extension')
+        start_lift  = self._get_joint('joint_lift')
+        start_ext   = self._get_joint('wrist_extension')
         start_pitch = self._get_joint('joint_wrist_pitch')
-        start_yaw = self._get_joint('joint_wrist_yaw')
+        start_yaw   = self._get_joint('joint_wrist_yaw')
 
         # Lift to default position
         self.move_to_pose({
-            'joint_lift': self.lift_height,
+            'joint_lift':        self.lift_height,
             'joint_wrist_pitch': self.wrist_pitch,
-            'joint_wrist_yaw': self.wrist_yaw,
+            'joint_wrist_yaw':   self.wrist_yaw,
         }, blocking=True)
         if self._cancel:
             return self._retract_and_reset(start_lift, start_ext,
                                            start_pitch, start_yaw, ok=False)
 
+        # Compute extension from marker depth, leaving safe clearance.
+        # marker_pos[2] is camera-frame z (distance from camera to marker).
+        # ext_scale_factor is conservative — tune on real robot if arm
+        # consistently over- or under-shoots.
+        marker_depth  = float(marker_pos[2])
+        current_ext   = self._get_joint('wrist_extension')
+        ext_scale     = 0.8  # conservative: use 80% of depth as extension
+        desired_ext   = current_ext + (marker_depth - self.safe_distance_m) * ext_scale
+        extend_to     = min(desired_ext, self.extend_target)
+        extend_to     = max(extend_to, current_ext)  # never retract in this step
+
+        self.get_logger().info(
+            f"Marker depth={marker_depth:.3f}m → extending to "
+            f"{extend_to:.3f}m (safe clearance={self.safe_distance_m:.2f}m)")
+
         # Slow reach: step the wrist toward the absolute extend_target with a
         # pause between each step for slow motion
-        ext_from = self._get_joint('wrist_extension')
-        span = self.extend_target - ext_from
+        ext_from = current_ext
+        span = extend_to - ext_from
         n_steps = max(1, round(abs(span) / self.extend_step))
         pause_per_step = self.extend_duration / n_steps
         for i in range(1, n_steps + 1):
@@ -158,9 +292,9 @@ class FishDeliver(hm.HelloNode):
         # Retract first (away from the child), then restore the rest.
         self.move_to_pose({'wrist_extension': ext}, blocking=True)
         self.move_to_pose({
-            'joint_lift': lift,
+            'joint_lift':        lift,
             'joint_wrist_pitch': pitch,
-            'joint_wrist_yaw': yaw,
+            'joint_wrist_yaw':   yaw,
         }, blocking=True)
         self.get_logger().info("Delivery complete; pose reset." if ok
                                else "Delivery aborted; pose reset.")
