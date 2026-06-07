@@ -19,6 +19,8 @@ The delivery motion is deliberately dumb and slow for safety near a child:
 """
 import threading
 import time
+import traceback
+import os
 import cv2
 import cv2.aruco as aruco
 import numpy as np
@@ -28,6 +30,8 @@ from std_msgs.msg import Empty, Bool
 import hello_helpers.hello_misc as hm
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import TransformBroadcaster
 
 START_TOPIC   = "/deliver_fish/start"
 RELEASE_TOPIC = "/deliver_fish/release"
@@ -51,7 +55,7 @@ class FishDeliver(hm.HelloNode):
 
         # marker for child delivery
         self.marker_id       = 90
-        self.marker_size_m   = 0.13    # 130mm printed size, change if need
+        self.marker_size_m   = 0.20    # 200mm printed size
 
         # Tunable pose / timing (setup-dependent; tweak per session at launch).
         # Hardcoded to avoid conflicts with HelloNode's pre-declared parameters.
@@ -64,9 +68,12 @@ class FishDeliver(hm.HelloNode):
         self.wait_sec        = 30.0    # s, hold for the child to grab
         self.search_timeout  = 15.0    # s, how long to scan before giving up
 
-        # Camera movement, can remove if causes too much errors or unnecessary
-        self.head_tilt_search = -1.0   # rad, negative = look down at floor
-        self.head_pan_search  = -1.0   # rad, negative = look toward arm/board side
+        # Head sweep for marker search. TBD: tune to your setup.
+        self.head_tilt_search = -0.5   # TBD: rad, negative = look down at floor
+        self.head_pan_min     = -3.0  # TBD: rad, sweep start (one side)
+        self.head_pan_max     =  -0.4   # TBD: rad, sweep end (other side)
+        self.head_pan_steps   = 7      # TBD: number of poses across the sweep
+        self.settle_per_pose  = 0.8    # TBD: s, dwell per pose before detecting
         self.safe_distance_m  = 0.5    # m, min distance to human during reach
 
         self._busy = False
@@ -80,6 +87,12 @@ class FishDeliver(hm.HelloNode):
         self._aruco_dict = aruco.getPredefinedDictionary(ARUCO_DICT)
         self._aruco_params = aruco.DetectorParameters()
         self._detector = aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
+        self._optical_frame = None
+        self._tf_broadcaster = TransformBroadcaster(self)
+
+        self._debug_log_path = os.path.expanduser("~/fish_deliver_debug.log")
+        self._debug_log = open(self._debug_log_path, "a")
+        self.get_logger().info(f"Debug scan -> {self._debug_log_path}")
 
         cb = ReentrantCallbackGroup()
 
@@ -104,6 +117,7 @@ class FishDeliver(hm.HelloNode):
             return  # already have it
         self._camera_matrix = np.array(msg.k).reshape((3, 3))
         self._dist_coeffs = np.array(msg.d)
+        self._optical_frame = msg.header.frame_id
         self.get_logger().info("Camera info received; ready to detect markers.")
 
     def _on_image(self, msg):
@@ -166,95 +180,99 @@ class FishDeliver(hm.HelloNode):
 
             # Pass marker_pos into _deliver so arm uses actual depth to child
             self._publish_done(self._deliver(marker_pos))
+        except Exception:
+            self.get_logger().error(
+                "Delivery failed:\n" + traceback.format_exc())
+            self._publish_done(False)
         finally:
             self._busy = False
 
     def _find_marker(self):
         """
-        Tilt head down, scan for Marker ID self.marker_id, return its translation
-        vector in camera frame (x, y, z meters) or None if not found or cancelled.
+        Sweep the head across a pan range at a fixed downward tilt, checking each
+        pose for Marker ID self.marker_id. Return its translation vector in the
+        camera frame (x, y, z meters), or None if not found / cancelled.
+        Re-sweeps until search_timeout elapses.
         """
-        self.get_logger().info(
-            f"Tilting head to search for marker "
-            f"(pan={self.head_pan_search:.2f}, tilt={self.head_tilt_search:.2f})...")
-        self.move_to_pose({
-            'joint_head_pan':  self.head_pan_search,
-            'joint_head_tilt': self.head_tilt_search,
-        }, blocking=True)
-
-        time.sleep(1.0)  # wait for the head to settle and frames to update
-
+        pans = np.linspace(self.head_pan_min, self.head_pan_max,
+                           self.head_pan_steps)
         deadline = time.time() + self.search_timeout
+
         while time.time() < deadline and not self._cancel:
-            with self._frame_lock:
-                frame = self._latest_frame.copy() \
-                    if self._latest_frame is not None else None
-            if frame is None:
-                time.sleep(0.1)
-                continue
+            for pan in pans:
+                if self._cancel or time.time() >= deadline:
+                    break
 
-            # Convert to grayscale for more reliable ArUco detection
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                self.move_to_pose({
+                    'joint_head_pan':  float(pan),
+                    'joint_head_tilt': self.head_tilt_search,
+                }, blocking=True)
+                time.sleep(self.settle_per_pose)
 
-            # Try several 5x5 dictionaries. The printed marker may have been
-            # generated from a different 5x5 family than expected.
-            dicts_to_try = [
-                ("5X5_1000", aruco.DICT_5X5_1000),
-                ("5X5_250",  aruco.DICT_5X5_250),
-                ("5X5_100",  aruco.DICT_5X5_100),
-                ("5X5_50",   aruco.DICT_5X5_50),
-            ]
-
-            marker_found = False
-
-            for dict_name, dict_type in dicts_to_try:
-                test_dict = aruco.getPredefinedDictionary(dict_type)
-                detector = aruco.ArucoDetector(
-                    test_dict,
-                    aruco.DetectorParameters()
-                )
-
-                corners, ids, _ = detector.detectMarkers(gray)
-
-                # Skip dictionaries that detect nothing
-                if ids is None:
+                with self._frame_lock:
+                    frame = self._latest_frame.copy() \
+                        if self._latest_frame is not None else None
+                if frame is None:
+                    self.get_logger().warn(f"pan={pan:.2f}: no camera frame")
                     continue
 
-                self.get_logger().info(
-                    f"Detected IDs {ids.flatten()} using {dict_name}"
-                )
-
-                marker_found = True
-
-                for i, marker_id in enumerate(ids.flatten()):
-                    if marker_id != self.marker_id:
-                        continue
-
-                    rvec, tvec, _ = aruco.estimatePoseSingleMarkers(
-                        [corners[i]],
-                        self.marker_size_m,
-                        self._camera_matrix,
-                        self._dist_coeffs
-                    )
-
-                    tvec = tvec[0][0]  # unpack from arrays
-
+                self._debug_scan(pan, frame)
+                tvec = self._detect_marker(frame)
+                if tvec is not None:
                     self.get_logger().info(
-                        f"Found marker {marker_id} using {dict_name} at tvec {tvec}."
-                    )
-
+                        f"Found marker {self.marker_id} at "
+                        f"pan={pan:.2f}, tvec={tvec}.")
                     return tvec
 
-            # No marker found in any dictionary
-            if not marker_found:
-                time.sleep(0.05)
-                continue
-
-            time.sleep(0.05)
-
         self.get_logger().warn(
-            f"Marker {self.marker_id} not found after searching for "
+            f"Marker {self.marker_id} not found after sweeping for "
             f"{self.search_timeout:.0f}s.")
+        return None
+
+    def _debug_scan(self, pan, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        candidates = [
+            ("5X5_50",   aruco.DICT_5X5_50),
+            ("5X5_100",  aruco.DICT_5X5_100),
+            ("5X5_250",  aruco.DICT_5X5_250),
+            ("5X5_1000", aruco.DICT_5X5_1000),
+            ("4X4_1000", aruco.DICT_4X4_1000),
+            ("6X6_250",  aruco.DICT_6X6_250),
+            ("ORIGINAL", aruco.DICT_ARUCO_ORIGINAL),
+        ]
+        found = []
+        for name, d in candidates:
+            det = aruco.ArucoDetector(
+                aruco.getPredefinedDictionary(d), aruco.DetectorParameters())
+            _, ids, _ = det.detectMarkers(gray)
+            if ids is not None:
+                found.append(f"{name}:{sorted(int(i) for i in ids.flatten())}")
+        self._dbg(f"pan={pan:.2f} dicts: " + ("  ".join(found) if found else "NONE"))
+
+    def _dbg(self, msg):
+        self._debug_log.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        self._debug_log.flush()
+
+    def _detect_marker(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self._detector.detectMarkers(gray)
+        if ids is None:
+            return None
+        for i, marker_id in enumerate(ids.flatten()):
+            if marker_id != self.marker_id:
+                continue
+            half = self.marker_size_m / 2.0
+            obj_pts = np.array([
+                [-half,  half, 0.0],
+                [ half,  half, 0.0],
+                [ half, -half, 0.0],
+                [-half, -half, 0.0],
+            ], dtype=np.float32)
+            ok, rvec, tvec = cv2.solvePnP(
+                obj_pts, corners[i][0],
+                self._camera_matrix, self._dist_coeffs)
+            if ok:
+                return tvec.flatten()
         return None
 
     def _deliver(self, marker_pos):
