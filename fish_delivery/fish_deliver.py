@@ -1,8 +1,6 @@
 """Hand the caught fish to the child, driven directly by the game master.
-
 Same pattern as fish_grab: a persistent HelloNode commanded over topics, with
 the actual motion run on a worker thread so the executor stays free.
-
     /deliver_fish/start    std_msgs/Empty   begin a delivery
     /deliver_fish/release  std_msgs/Empty   child has the fish; stop waiting and
                                             retract now (the voice-command hook
@@ -10,24 +8,20 @@ the actual motion run on a worker thread so the executor stays free.
     /deliver_fish/stop      std_msgs/Empty   abort: retract and reset immediately
     /deliver_done           std_msgs/Bool    published when done (always True on a
                                             normal/early finish, False on abort)
-
 The delivery motion is deliberately dumb and slow for safety near a child:
-    1. lift to mid-height, angle the gripper down a bit
-    2. extend the arm ~0.4 m across the mat VERY SLOWLY (timed reach)
-    3. wait (default 30 s, or until /deliver_fish/release) for the child to grab
-    4. retract, restore the starting pose
-    5. publish /deliver_done so the game master returns to the start state
-
-Later the 30 s wait becomes a voice command: just publish on
-/deliver_fish/release instead of relying on the timeout.
+    1. tilt head down to find ArUco marker ID 90 on the floor
+    2. lift to mid-height, angle the gripper down a bit
+    3. extend the arm toward the child VERY SLOWLY, using marker depth
+       to stop at a safe distance
+    4. wait (default 30 s, or until /deliver_fish/release) for the child to grab
+    5. retract, restore the starting pose
+    6. publish /deliver_done so the game master returns to the start state
 """
 import threading
 import time
-
 import cv2
 import cv2.aruco as aruco
 import numpy as np
-
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from std_msgs.msg import Empty, Bool
@@ -56,34 +50,24 @@ class FishDeliver(hm.HelloNode):
                           wait_for_first_pointcloud=False)
 
         # marker for child delivery
-        self.marker_id     = int(self.declare_parameter('marker_id', MARKER_ID).value)
-        self.marker_size_m = self.declare_parameter('marker_size_m', 0.13).value  # 0.13 is 130mm print size, change if need
+        self.marker_id       = 90
+        self.marker_size_m   = 0.13    # 130mm printed size, change if need
 
         # Tunable pose / timing (setup-dependent; tweak per session at launch).
-        self.lift_height = self.declare_parameter(
-            'lift_height', 0.7).value          # m, arm lift for the hand-off
-        self.wrist_pitch = self.declare_parameter(
-            'wrist_pitch', -0.3).value         # rad, negative = tip down a bit
-        self.wrist_yaw = self.declare_parameter(
-            'wrist_yaw', 0.0).value            # rad, point straight across mat
-        self.extend_target = self.declare_parameter(
-            'extend_target', 0.45).value       # m, absolute wrist_extension at full reach
-        self.extend_step = self.declare_parameter(
-            'extend_step', 0.02).value         # m per step (smaller = smoother)
-        self.extend_duration = self.declare_parameter(
-            'extend_duration', 20.0).value     # s, total time for the reach
-        self.wait_sec = self.declare_parameter(
-            'wait_sec', 30.0).value            # s, hold for the child to grab
-        self.search_timeout = self.declare_parameter(
-            'search_timeout', 15.0).value      # s, how long to scan before giving up
+        # Hardcoded to avoid conflicts with HelloNode's pre-declared parameters.
+        self.lift_height     = 0.7     # m, arm lift for the hand-off
+        self.wrist_pitch     = -0.3    # rad, negative = tip down a bit
+        self.wrist_yaw       = 0.0     # rad, point straight across mat
+        self.extend_target   = 0.45    # m, absolute wrist_extension at full reach
+        self.extend_step     = 0.02    # m per step (smaller = smoother)
+        self.extend_duration = 20.0    # s, total time for the reach
+        self.wait_sec        = 30.0    # s, hold for the child to grab
+        self.search_timeout  = 15.0    # s, how long to scan before giving up
 
         # Camera movement, can remove if causes too much errors or unnecessary
-        self.head_tilt_search = self.declare_parameter(
-            'head_tilt_search', -0.8).value    # rad, single float — negative = look down at floor
-        self.head_pan_search = self.declare_parameter(
-            'head_pan_search', 0.0).value
-        self.safe_distance_m = self.declare_parameter(
-            'safe_distance_m', 0.5).value      # m, min distance to human during reach
+        self.head_tilt_search = -1.0   # rad, negative = look down at floor
+        self.head_pan_search  = -1.0   # rad, negative = look toward arm/board side
+        self.safe_distance_m  = 0.5    # m, min distance to human during reach
 
         self._busy = False
         self._cancel = False
@@ -192,8 +176,7 @@ class FishDeliver(hm.HelloNode):
         """
         self.get_logger().info(
             f"Tilting head to search for marker "
-            f"(pan={self.head_pan_search:.2f}, "
-            f"tilt={self.head_tilt_search:.2f})...")
+            f"(pan={self.head_pan_search:.2f}, tilt={self.head_tilt_search:.2f})...")
         self.move_to_pose({
             'joint_head_pan':  self.head_pan_search,
             'joint_head_tilt': self.head_tilt_search,
