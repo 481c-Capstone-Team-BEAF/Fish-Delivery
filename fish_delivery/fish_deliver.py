@@ -193,21 +193,62 @@ class FishDeliver(hm.HelloNode):
                 time.sleep(0.1)
                 continue
 
-            corners, ids, _ = self._detector.detectMarkers(frame)
+            # Convert to grayscale for more reliable ArUco detection
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # Skip frames where no markers were detected
-            if ids is None:
+            # Try several 5x5 dictionaries. The printed marker may have been
+            # generated from a different 5x5 family than expected.
+            dicts_to_try = [
+                ("5X5_1000", aruco.DICT_5X5_1000),
+                ("5X5_250",  aruco.DICT_5X5_250),
+                ("5X5_100",  aruco.DICT_5X5_100),
+                ("5X5_50",   aruco.DICT_5X5_50),
+            ]
+
+            marker_found = False
+
+            for dict_name, dict_type in dicts_to_try:
+                test_dict = aruco.getPredefinedDictionary(dict_type)
+                detector = aruco.ArucoDetector(
+                    test_dict,
+                    aruco.DetectorParameters()
+                )
+
+                corners, ids, _ = detector.detectMarkers(gray)
+
+                # Skip dictionaries that detect nothing
+                if ids is None:
+                    continue
+
+                self.get_logger().info(
+                    f"Detected IDs {ids.flatten()} using {dict_name}"
+                )
+
+                marker_found = True
+
+                for i, marker_id in enumerate(ids.flatten()):
+                    if marker_id != self.marker_id:
+                        continue
+
+                    rvec, tvec, _ = aruco.estimatePoseSingleMarkers(
+                        [corners[i]],
+                        self.marker_size_m,
+                        self._camera_matrix,
+                        self._dist_coeffs
+                    )
+
+                    tvec = tvec[0][0]  # unpack from arrays
+
+                    self.get_logger().info(
+                        f"Found marker {marker_id} using {dict_name} at tvec {tvec}."
+                    )
+
+                    return tvec
+
+            # No marker found in any dictionary
+            if not marker_found:
                 time.sleep(0.05)
                 continue
-
-            for i, marker_id in enumerate(ids.flatten()):
-                if marker_id != self.marker_id:
-                    continue
-                rvec, tvec, _ = aruco.estimatePoseSingleMarkers(
-                    [corners[i]], self.marker_size_m, self._camera_matrix, self._dist_coeffs)
-                tvec = tvec[0][0]  # unpack from arrays
-                self.get_logger().info(f"Found marker {marker_id} at tvec {tvec}.")
-                return tvec
 
             time.sleep(0.05)
 
