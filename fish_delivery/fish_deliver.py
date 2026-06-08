@@ -44,19 +44,19 @@ class FishDeliver(hm.HelloNode):
 
         # Tunable pose / timing (setup-dependent; tweak per session at launch).
         self.lift_height = self.declare_parameter(
-            'lift_height', 0.7).value          # m, arm lift for the hand-off
+            'lift_height', 0.95).value          # m, arm lift for the hand-off
         self.wrist_pitch = self.declare_parameter(
             'wrist_pitch', -0.3).value         # rad, negative = tip down a bit
         self.wrist_yaw = self.declare_parameter(
             'wrist_yaw', 0.0).value            # rad, point straight across mat
         self.extend_target = self.declare_parameter(
-            'extend_target', 0.45).value       # m, absolute wrist_extension at full reach
+            'extend_target', 0.55).value       # m, absolute wrist_extension at full reach
         self.extend_step = self.declare_parameter(
-            'extend_step', 0.02).value         # m per step (smaller = smoother)
+            'extend_step', 0.04).value         # m per step (smaller = smoother)
         self.extend_duration = self.declare_parameter(
-            'extend_duration', 20.0).value     # s, total time for the reach
+            'extend_duration', 5.0).value     # s, total time for the reach
         self.wait_sec = self.declare_parameter(
-            'wait_sec', 30.0).value            # s, hold for the child to grab
+            'wait_sec', 6.0).value            # s, hold for the child to grab
 
         self._busy = False
         self._cancel = False
